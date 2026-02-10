@@ -10,7 +10,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
 use serde::Deserialize;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_POINTS: usize = 600; // ~60 seconds of history
 const URL: &str = "http://localhost:6333/collections/benchmark";
 
