@@ -782,115 +782,69 @@ fn draw_chart(
 }
 
 fn draw_search_chart(f: &mut Frame, app: &App, area: Rect) {
+    let title = "Search Avg Latency (us)";
     if app.search_latencies.is_empty() && app.filtered_search_latencies.is_empty() {
         let msg = Paragraph::new("No data yet.")
             .style(Style::default().fg(Color::DarkGray))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Search Avg Latency"),
+                    .title(title),
             );
         f.render_widget(msg, area);
         return;
     }
 
-    // Split into two stacked sub-charts with independent Y scales
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-        .split(area);
-
-    // Shared X range
     let all_data = app
         .search_latencies
         .iter()
         .chain(app.filtered_search_latencies.iter());
     let x_min = all_data.clone().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
     let x_max = all_data.map(|(x, _)| *x).fold(0.0f64, f64::max);
+    let y_max = app.max_y_search.max(app.max_y_filtered_search).max(1.0);
 
-    // Top: QueryBatch (magenta)
-    {
-        let y_max = app.max_y_search.max(1.0);
-        let x_labels = vec![
-            Span::raw(format!("{:.1}s", x_min * 0.1)),
-            Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * 0.1)),
-            Span::raw(format!("{:.1}s", x_max * 0.1)),
-        ];
-        let y_labels = vec![
-            Span::raw("0"),
-            Span::raw(format!("{:.0}", y_max / 2.0)),
-            Span::raw(format!("{:.0}", y_max)),
-        ];
-        let ds = Dataset::default()
-            .name("QueryBatch")
-            .marker(ratatui::symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Magenta))
-            .data(&app.search_latencies);
-        let chart = Chart::new(vec![ds])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Search: QueryBatch (us)"),
-            )
-            .x_axis(
-                Axis::default()
-                    .title("Time")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([x_min, x_max])
-                    .labels(x_labels),
-            )
-            .y_axis(
-                Axis::default()
-                    .title("us")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([0.0, y_max])
-                    .labels(y_labels),
-            );
-        f.render_widget(chart, chunks[0]);
-    }
+    let x_labels = vec![
+        Span::raw(format!("{:.1}s", x_min * 0.1)),
+        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * 0.1)),
+        Span::raw(format!("{:.1}s", x_max * 0.1)),
+    ];
+    let y_labels = vec![
+        Span::raw("0"),
+        Span::raw(format!("{:.0}", y_max / 2.0)),
+        Span::raw(format!("{:.0}", y_max)),
+    ];
 
-    // Bottom: filtered_small (blue)
-    {
-        let y_max = app.max_y_filtered_search.max(1.0);
-        let x_labels = vec![
-            Span::raw(format!("{:.1}s", x_min * 0.1)),
-            Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * 0.1)),
-            Span::raw(format!("{:.1}s", x_max * 0.1)),
-        ];
-        let y_labels = vec![
-            Span::raw("0"),
-            Span::raw(format!("{:.0}", y_max / 2.0)),
-            Span::raw(format!("{:.0}", y_max)),
-        ];
-        let ds = Dataset::default()
-            .name("filtered_small")
-            .marker(ratatui::symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Blue))
-            .data(&app.filtered_search_latencies);
-        let chart = Chart::new(vec![ds])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Search: filtered_small_cardinality (us)"),
-            )
-            .x_axis(
-                Axis::default()
-                    .title("Time")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([x_min, x_max])
-                    .labels(x_labels),
-            )
-            .y_axis(
-                Axis::default()
-                    .title("us")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([0.0, y_max])
-                    .labels(y_labels),
-            );
-        f.render_widget(chart, chunks[1]);
-    }
+    let ds_query = Dataset::default()
+        .name("QueryBatch")
+        .marker(ratatui::symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Magenta))
+        .data(&app.search_latencies);
+
+    let ds_filtered = Dataset::default()
+        .name("filtered_small")
+        .marker(ratatui::symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Blue))
+        .data(&app.filtered_search_latencies);
+
+    let chart = Chart::new(vec![ds_query, ds_filtered])
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .x_axis(
+            Axis::default()
+                .title("Time")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([x_min, x_max])
+                .labels(x_labels),
+        )
+        .y_axis(
+            Axis::default()
+                .title("us")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([0.0, y_max])
+                .labels(y_labels),
+        );
+    f.render_widget(chart, area);
 }
 
 fn draw_points_chart(f: &mut Frame, app: &App, area: Rect) {
