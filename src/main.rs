@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
@@ -102,13 +103,23 @@ enum Status {
     Offline,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum OptKind {
+    None,      // Green  — no optimizing entries
+    MergeOnly, // Red    — only merge
+    IndexOnly, // Yellow — only indexing (or other non-merge)
+    Both,      // Magenta — merge + indexing
+}
+
 struct App {
     // queue plot
     queue_lengths: Vec<(f64, f64)>,
     max_y_queue: f64,
     // search plot
     search_latencies: Vec<(f64, f64)>,
+    filtered_search_latencies: Vec<(f64, f64)>,
     max_y_search: f64,
+    max_y_filtered_search: f64,
     // points plot
     plain_points: Vec<(f64, f64)>,
     indexed_points: Vec<(f64, f64)>,
@@ -118,6 +129,7 @@ struct App {
     plain_segments: Vec<(f64, f64)>,
     nonplain_segments: Vec<(f64, f64)>,
     pending_optimizations: Vec<(f64, f64)>,
+    opt_statuses: Vec<(f64, OptKind)>,
     max_y_segments: f64,
 
     tick: f64,
@@ -152,7 +164,9 @@ impl App {
             queue_lengths: Vec::new(),
             max_y_queue: 10.0,
             search_latencies: Vec::new(),
+            filtered_search_latencies: Vec::new(),
             max_y_search: 100.0,
+            max_y_filtered_search: 100.0,
             plain_points: Vec::new(),
             indexed_points: Vec::new(),
             max_y_points: 100.0,
@@ -160,6 +174,7 @@ impl App {
             plain_segments: Vec::new(),
             nonplain_segments: Vec::new(),
             pending_optimizations: Vec::new(),
+            opt_statuses: Vec::new(),
             max_y_segments: 10.0,
             tick: 0.0,
             status: Status::WaitingForProcess,
@@ -176,21 +191,43 @@ impl App {
     fn reset(&mut self) {
         self.queue_lengths.clear();
         self.search_latencies.clear();
+        self.filtered_search_latencies.clear();
         self.plain_points.clear();
         self.indexed_points.clear();
         self.total_segments.clear();
         self.plain_segments.clear();
         self.nonplain_segments.clear();
         self.pending_optimizations.clear();
+        self.opt_statuses.clear();
         self.tick = 0.0;
         self.status = Status::WaitingForProcess;
         self.max_y_queue = 10.0;
         self.max_y_search = 100.0;
+        self.max_y_filtered_search = 100.0;
         self.max_y_points = 100.0;
         self.max_y_segments = 10.0;
         self.recording = false;
         self.last_json = None;
         self.save_msg = None;
+    }
+
+    fn drop_first_half(&mut self) {
+        fn drain_half<T>(v: &mut Vec<T>) {
+            let mid = v.len() / 2;
+            if mid > 0 {
+                v.drain(..mid);
+            }
+        }
+        drain_half(&mut self.queue_lengths);
+        drain_half(&mut self.search_latencies);
+        drain_half(&mut self.filtered_search_latencies);
+        drain_half(&mut self.plain_points);
+        drain_half(&mut self.indexed_points);
+        drain_half(&mut self.total_segments);
+        drain_half(&mut self.plain_segments);
+        drain_half(&mut self.nonplain_segments);
+        drain_half(&mut self.pending_optimizations);
+        drain_half(&mut self.opt_statuses);
     }
 
     fn save_json(&mut self) {
@@ -221,70 +258,72 @@ impl App {
         }
     }
 
-    fn poll(&mut self) {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_millis(500))
-            .build();
-
-        let req = agent.get(&self.url);
-        let req = match &self.api_key {
-            Some(key) => req.set("api-key", key),
-            None => req,
-        };
-
-        match req.call() {
-            Ok(resp) => {
-                if let Ok(json) = resp.into_json::<Value>() {
-                    if let Some(len) = find_update_queue_length(&json) {
-                        self.status = Status::Online;
-                        self.last_json = Some(json);
-                        if !self.recording {
-                            if len > 0.0 {
-                                self.recording = true;
-                            } else {
-                                self.tick += 1.0;
-                                return;
-                            }
+    fn apply_poll_result(&mut self, result: Result<Value, ()>) {
+        match result {
+            Ok(json) => {
+                if let Some(len) = find_update_queue_length(&json) {
+                    self.status = Status::Online;
+                    self.last_json = Some(json);
+                    if !self.recording {
+                        if len > 0.0 {
+                            self.recording = true;
+                        } else {
+                            self.tick += 1.0;
+                            return;
                         }
-                        let json_ref = self.last_json.as_ref().unwrap();
+                    }
+                    let json_ref = self.last_json.as_ref().unwrap();
 
-                        // queue
-                        Self::push_bounded(&mut self.queue_lengths, (self.tick, len));
-                        if len > self.max_y_queue {
-                            self.max_y_queue = len;
+                    // queue
+                    Self::push_bounded(&mut self.queue_lengths, (self.tick, len));
+                    if len > self.max_y_queue {
+                        self.max_y_queue = len;
+                    }
+
+                    // search
+                    if let Some(latency) = find_query_batch_avg(json_ref) {
+                        Self::push_bounded(&mut self.search_latencies, (self.tick, latency));
+                        if latency > self.max_y_search {
+                            self.max_y_search = latency;
                         }
-
-                        // search
-                        if let Some(latency) = find_query_batch_avg(json_ref) {
-                            Self::push_bounded(&mut self.search_latencies, (self.tick, latency));
-                            if latency > self.max_y_search {
-                                self.max_y_search = latency;
-                            }
-                        }
-
-                        // points
-                        let (plain, indexed) = find_segment_points(json_ref);
-                        Self::push_bounded(&mut self.plain_points, (self.tick, plain));
-                        Self::push_bounded(&mut self.indexed_points, (self.tick, indexed));
-                        let points_max = plain.max(indexed);
-                        if points_max > self.max_y_points {
-                            self.max_y_points = points_max;
-                        }
-
-                        // segments
-                        let (total, plain_seg, nonplain_seg) = count_segments(json_ref);
-                        let pending = count_pending_optimizations(json_ref);
-                        Self::push_bounded(&mut self.total_segments, (self.tick, total));
-                        Self::push_bounded(&mut self.plain_segments, (self.tick, plain_seg));
-                        Self::push_bounded(&mut self.nonplain_segments, (self.tick, nonplain_seg));
+                    }
+                    if let Some(flt) = find_filtered_small_cardinality_sum(json_ref) {
                         Self::push_bounded(
-                            &mut self.pending_optimizations,
-                            (self.tick, pending),
+                            &mut self.filtered_search_latencies,
+                            (self.tick, flt),
                         );
-                        let seg_max = total.max(pending);
-                        if seg_max > self.max_y_segments {
-                            self.max_y_segments = seg_max;
+                        if flt > self.max_y_filtered_search {
+                            self.max_y_filtered_search = flt;
                         }
+                    }
+
+                    // points
+                    let (plain, indexed) = find_segment_points(json_ref);
+                    Self::push_bounded(&mut self.plain_points, (self.tick, plain));
+                    Self::push_bounded(&mut self.indexed_points, (self.tick, indexed));
+                    let points_max = plain.max(indexed);
+                    if points_max > self.max_y_points {
+                        self.max_y_points = points_max;
+                    }
+
+                    // segments
+                    let (total, plain_seg, nonplain_seg) = count_segments(json_ref);
+                    let pending = count_pending_optimizations(json_ref);
+                    Self::push_bounded(&mut self.total_segments, (self.tick, total));
+                    Self::push_bounded(&mut self.plain_segments, (self.tick, plain_seg));
+                    Self::push_bounded(&mut self.nonplain_segments, (self.tick, nonplain_seg));
+                    Self::push_bounded(
+                        &mut self.pending_optimizations,
+                        (self.tick, pending),
+                    );
+                    let opt_kind = detect_optimization_kind(json_ref);
+                    self.opt_statuses.push((self.tick, opt_kind));
+                    if self.opt_statuses.len() > MAX_POINTS {
+                        self.opt_statuses.remove(0);
+                    }
+                    let seg_max = total.max(pending);
+                    if seg_max > self.max_y_segments {
+                        self.max_y_segments = seg_max;
                     }
                 }
             }
@@ -305,6 +344,30 @@ fn find_query_batch_avg(value: &Value) -> Option<f64> {
     value
         .pointer("/result/requests/grpc/responses/~1qdrant.Points~1QueryBatch/avg_duration_micros")
         .and_then(|v| v.as_f64())
+}
+
+/// Sum filtered_small_cardinality.avg_duration_micros across all segments.
+fn find_filtered_small_cardinality_sum(value: &Value) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut found = false;
+    for_each_segment(value, |seg| {
+        if let Some(searches) = seg.get("vector_index_searches").and_then(|v| v.as_array()) {
+            for entry in searches {
+                if let Some(avg) = entry
+                    .pointer("/filtered_small_cardinality/avg_duration_micros")
+                    .and_then(|v| v.as_f64())
+                {
+                    sum += avg;
+                    found = true;
+                }
+            }
+        }
+    });
+    if found {
+        Some(sum)
+    } else {
+        None
+    }
 }
 
 /// Sum num_points across segments, split by plain vs non-plain index type.
@@ -370,6 +433,50 @@ fn count_pending_optimizations(value: &Value) -> f64 {
         }
     }
     count as f64
+}
+
+/// Inspect optimization log entries with status=="optimizing" and classify by name.
+fn detect_optimization_kind(value: &Value) -> OptKind {
+    let mut has_merge = false;
+    let mut has_other = false;
+    if let Some(collections) = value.pointer("/result/collections/collections") {
+        if let Some(arr) = collections.as_array() {
+            for col in arr {
+                if let Some(shards) = col.get("shards").and_then(|s| s.as_array()) {
+                    for shard in shards {
+                        if let Some(log) = shard
+                            .pointer("/local/optimizations/log")
+                            .and_then(|v| v.as_array())
+                        {
+                            for entry in log {
+                                let status = entry
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if status == "optimizing" {
+                                    let name = entry
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if name == "merge" {
+                                        has_merge = true;
+                                    } else {
+                                        has_other = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match (has_merge, has_other) {
+        (true, true) => OptKind::Both,
+        (true, false) => OptKind::MergeOnly,
+        (false, true) => OptKind::IndexOnly,
+        (false, false) => OptKind::None,
+    }
 }
 
 fn is_plain_segment(seg: &Value) -> bool {
@@ -438,29 +545,67 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut app = App::new(cli.skip_access, plots);
-    let mut last_poll = Instant::now() - POLL_INTERVAL;
+
+    // Run HTTP polling in a background thread so the UI stays responsive.
+    let poll_url = app.url.clone();
+    let poll_api_key = app.api_key.clone();
+    let poll_result: Arc<Mutex<Option<Result<Value, ()>>>> = Arc::new(Mutex::new(None));
+    let poll_result_writer = Arc::clone(&poll_result);
+    let poll_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let poll_running_thread = Arc::clone(&poll_running);
+
+    let poll_thread = std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(500))
+            .build();
+        while poll_running_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            let req = agent.get(&poll_url);
+            let req = match &poll_api_key {
+                Some(key) => req.set("api-key", key),
+                None => req,
+            };
+            let result = match req.call() {
+                Ok(resp) => match resp.into_json::<Value>() {
+                    Ok(json) => Some(Ok(json)),
+                    Err(_) => Some(Err(())),
+                },
+                Err(_) => Some(Err(())),
+            };
+            if let Ok(mut lock) = poll_result_writer.lock() {
+                *lock = result;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    });
 
     loop {
-        if last_poll.elapsed() >= POLL_INTERVAL {
-            app.poll();
-            last_poll = Instant::now();
+        // Check for new poll results from the background thread.
+        if let Ok(mut lock) = poll_result.lock() {
+            if let Some(result) = lock.take() {
+                app.apply_poll_result(result);
+            }
         }
 
         terminal.draw(|f| draw(f, &app))?;
 
-        if event::poll(Duration::from_millis(10))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('r') => app.reset(),
                         KeyCode::Char('s') => app.save_json(),
+                        KeyCode::Char('d') => app.drop_first_half(),
                         _ => {}
                     }
                 }
             }
         }
     }
+
+    // Signal the background thread to stop and wait for it.
+    poll_running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = poll_thread.join();
 
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
@@ -560,16 +705,7 @@ fn draw(f: &mut Frame, app: &App) {
         idx += 1;
     }
     if plots.search {
-        draw_chart(
-            f,
-            &app.search_latencies,
-            app.max_y_search,
-            "Search Avg Latency (/qdrant.Points/QueryBatch)",
-            "search",
-            "us",
-            Color::Magenta,
-            chunks[idx],
-        );
+        draw_search_chart(f, app, chunks[idx]);
         idx += 1;
     }
     if plots.points {
@@ -645,6 +781,118 @@ fn draw_chart(
     f.render_widget(chart, area);
 }
 
+fn draw_search_chart(f: &mut Frame, app: &App, area: Rect) {
+    if app.search_latencies.is_empty() && app.filtered_search_latencies.is_empty() {
+        let msg = Paragraph::new("No data yet.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Search Avg Latency"),
+            );
+        f.render_widget(msg, area);
+        return;
+    }
+
+    // Split into two stacked sub-charts with independent Y scales
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(area);
+
+    // Shared X range
+    let all_data = app
+        .search_latencies
+        .iter()
+        .chain(app.filtered_search_latencies.iter());
+    let x_min = all_data.clone().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
+    let x_max = all_data.map(|(x, _)| *x).fold(0.0f64, f64::max);
+
+    // Top: QueryBatch (magenta)
+    {
+        let y_max = app.max_y_search.max(1.0);
+        let x_labels = vec![
+            Span::raw(format!("{:.1}s", x_min * 0.1)),
+            Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * 0.1)),
+            Span::raw(format!("{:.1}s", x_max * 0.1)),
+        ];
+        let y_labels = vec![
+            Span::raw("0"),
+            Span::raw(format!("{:.0}", y_max / 2.0)),
+            Span::raw(format!("{:.0}", y_max)),
+        ];
+        let ds = Dataset::default()
+            .name("QueryBatch")
+            .marker(ratatui::symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Magenta))
+            .data(&app.search_latencies);
+        let chart = Chart::new(vec![ds])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Search: QueryBatch (us)"),
+            )
+            .x_axis(
+                Axis::default()
+                    .title("Time")
+                    .style(Style::default().fg(Color::Gray))
+                    .bounds([x_min, x_max])
+                    .labels(x_labels),
+            )
+            .y_axis(
+                Axis::default()
+                    .title("us")
+                    .style(Style::default().fg(Color::Gray))
+                    .bounds([0.0, y_max])
+                    .labels(y_labels),
+            );
+        f.render_widget(chart, chunks[0]);
+    }
+
+    // Bottom: filtered_small (blue)
+    {
+        let y_max = app.max_y_filtered_search.max(1.0);
+        let x_labels = vec![
+            Span::raw(format!("{:.1}s", x_min * 0.1)),
+            Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * 0.1)),
+            Span::raw(format!("{:.1}s", x_max * 0.1)),
+        ];
+        let y_labels = vec![
+            Span::raw("0"),
+            Span::raw(format!("{:.0}", y_max / 2.0)),
+            Span::raw(format!("{:.0}", y_max)),
+        ];
+        let ds = Dataset::default()
+            .name("filtered_small")
+            .marker(ratatui::symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Blue))
+            .data(&app.filtered_search_latencies);
+        let chart = Chart::new(vec![ds])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Search: filtered_small_cardinality (us)"),
+            )
+            .x_axis(
+                Axis::default()
+                    .title("Time")
+                    .style(Style::default().fg(Color::Gray))
+                    .bounds([x_min, x_max])
+                    .labels(x_labels),
+            )
+            .y_axis(
+                Axis::default()
+                    .title("us")
+                    .style(Style::default().fg(Color::Gray))
+                    .bounds([0.0, y_max])
+                    .labels(y_labels),
+            );
+        f.render_widget(chart, chunks[1]);
+    }
+}
+
 fn draw_points_chart(f: &mut Frame, app: &App, area: Rect) {
     let title = "Segment Points (plain vs indexed)";
     if app.plain_points.is_empty() && app.indexed_points.is_empty() {
@@ -714,6 +962,14 @@ fn draw_segments_chart(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Split: chart gets most space, 1 row at the bottom for optimization status
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(area);
+    let chart_area = chunks[0];
+    let opt_area = chunks[1];
+
     let x_min = app.total_segments.first().map(|(x, _)| *x).unwrap_or(0.0);
     let x_max = app.total_segments.last().map(|(x, _)| *x).unwrap_or(1.0);
     let y_max = app.max_y_segments.max(1.0);
@@ -773,5 +1029,78 @@ fn draw_segments_chart(f: &mut Frame, app: &App, area: Rect) {
                 .bounds([0.0, y_max])
                 .labels(y_labels),
         );
-    f.render_widget(chart, area);
+    f.render_widget(chart, chart_area);
+
+    // Draw optimization status bar
+    draw_opt_status_bar(f, app, opt_area, x_min, x_max);
+}
+
+fn opt_kind_color(kind: OptKind) -> Color {
+    match kind {
+        OptKind::None => Color::Green,
+        OptKind::MergeOnly => Color::Red,
+        OptKind::IndexOnly => Color::Yellow,
+        OptKind::Both => Color::Magenta,
+    }
+}
+
+fn draw_opt_status_bar(f: &mut Frame, app: &App, area: Rect, x_min: f64, x_max: f64) {
+    if app.opt_statuses.is_empty() {
+        return;
+    }
+
+    // "opt: █merge █index █both █idle  " — colored legend
+    let dim = Style::default().fg(Color::DarkGray);
+    let legend_spans: Vec<Span> = vec![
+        Span::styled("opt: ", dim.add_modifier(Modifier::BOLD)),
+        Span::styled("█", Style::default().fg(Color::Red)),
+        Span::styled("merge ", dim),
+        Span::styled("█", Style::default().fg(Color::Yellow)),
+        Span::styled("index ", dim),
+        Span::styled("█", Style::default().fg(Color::Magenta)),
+        Span::styled("both ", dim),
+        Span::styled("█", Style::default().fg(Color::Green)),
+        Span::styled("idle ", dim),
+    ];
+    let label_width: usize = legend_spans.iter().map(|s| s.width()).sum();
+    let bar_width = (area.width as usize).saturating_sub(label_width);
+    if bar_width == 0 {
+        return;
+    }
+
+    let x_range = (x_max - x_min).max(1.0);
+
+    let mut spans: Vec<Span> = Vec::with_capacity(bar_width + legend_spans.len());
+    spans.extend(legend_spans);
+
+    for col in 0..bar_width {
+        let t = x_min + (col as f64 / bar_width as f64) * x_range;
+        let kind = find_nearest_opt_status(&app.opt_statuses, t);
+        spans.push(Span::styled("█", Style::default().fg(opt_kind_color(kind))));
+    }
+
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line);
+    f.render_widget(paragraph, area);
+}
+
+fn find_nearest_opt_status(statuses: &[(f64, OptKind)], t: f64) -> OptKind {
+    match statuses.binary_search_by(|(tick, _)| tick.partial_cmp(&t).unwrap()) {
+        Ok(idx) => statuses[idx].1,
+        Err(idx) => {
+            if idx == 0 {
+                statuses[0].1
+            } else if idx >= statuses.len() {
+                statuses[statuses.len() - 1].1
+            } else {
+                let prev = statuses[idx - 1];
+                let next = statuses[idx];
+                if (t - prev.0).abs() <= (next.0 - t).abs() {
+                    prev.1
+                } else {
+                    next.1
+                }
+            }
+        }
+    }
 }
