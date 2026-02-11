@@ -264,13 +264,8 @@ impl App {
                 if let Some(len) = find_update_queue_length(&json) {
                     self.status = Status::Online;
                     self.last_json = Some(json);
-                    if !self.recording {
-                        if len > 0.0 {
-                            self.recording = true;
-                        } else {
-                            self.tick += 1.0;
-                            return;
-                        }
+                    if !self.recording && len > 0.0 {
+                        self.recording = true;
                     }
                     let json_ref = self.last_json.as_ref().unwrap();
 
@@ -287,7 +282,7 @@ impl App {
                             self.max_y_search = latency;
                         }
                     }
-                    if let Some(flt) = find_filtered_small_cardinality_sum(json_ref) {
+                    if let Some(flt) = find_filtered_plain_sum(json_ref) {
                         Self::push_bounded(
                             &mut self.filtered_search_latencies,
                             (self.tick, flt),
@@ -328,7 +323,7 @@ impl App {
                 }
             }
             Err(_) => {
-                if self.queue_lengths.is_empty() {
+                if self.tick == 0.0 {
                     self.status = Status::WaitingForProcess;
                 } else {
                     self.status = Status::Offline;
@@ -346,15 +341,15 @@ fn find_query_batch_avg(value: &Value) -> Option<f64> {
         .and_then(|v| v.as_f64())
 }
 
-/// Sum filtered_small_cardinality.avg_duration_micros across all segments.
-fn find_filtered_small_cardinality_sum(value: &Value) -> Option<f64> {
+/// Sum filtered_plain.avg_duration_micros across all segments.
+fn find_filtered_plain_sum(value: &Value) -> Option<f64> {
     let mut sum = 0.0;
     let mut found = false;
     for_each_segment(value, |seg| {
         if let Some(searches) = seg.get("vector_index_searches").and_then(|v| v.as_array()) {
             for entry in searches {
                 if let Some(avg) = entry
-                    .pointer("/filtered_small_cardinality/avg_duration_micros")
+                    .pointer("/filtered_plain/avg_duration_micros")
                     .and_then(|v| v.as_f64())
                 {
                     sum += avg;
@@ -822,7 +817,7 @@ fn draw_search_chart(f: &mut Frame, app: &App, area: Rect) {
         .data(&app.search_latencies);
 
     let ds_filtered = Dataset::default()
-        .name("filtered_small")
+        .name("filtered_plain")
         .marker(ratatui::symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(Color::Blue))
