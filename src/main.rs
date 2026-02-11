@@ -690,7 +690,6 @@ fn draw(f: &mut Frame, app: &App) {
         draw_chart(
             f,
             &app.queue_lengths,
-            app.max_y_queue,
             "Update Queue Length (q: quit | r: reset | s: save json)",
             "queue length",
             "Length",
@@ -716,7 +715,6 @@ fn draw(f: &mut Frame, app: &App) {
 fn draw_chart(
     f: &mut Frame,
     data: &[(f64, f64)],
-    max_y: f64,
     title: &str,
     dataset_name: &str,
     y_title: &str,
@@ -733,7 +731,8 @@ fn draw_chart(
 
     let x_min = data.first().map(|(x, _)| *x).unwrap_or(0.0);
     let x_max = data.last().map(|(x, _)| *x).unwrap_or(1.0);
-    let y_max = max_y.max(1.0);
+    let actual_max = data.iter().map(|(_, y)| *y).fold(0.0f64, f64::max);
+    let y_max = actual_max.max(1.0);
 
     let x_labels = vec![
         Span::raw(format!("{:.1}s", x_min * 0.1)),
@@ -770,7 +769,7 @@ fn draw_chart(
             Axis::default()
                 .title(y_title)
                 .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, y_max])
+                .bounds([-y_max * 0.05, y_max])
                 .labels(y_labels),
         );
     f.render_widget(chart, area);
