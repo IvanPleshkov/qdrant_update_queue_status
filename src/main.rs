@@ -42,6 +42,10 @@ struct Cli {
     /// Show segments count plot
     #[arg(long)]
     segments: bool,
+
+    /// Keep spike flame graphs in original chronological order with real timestamps
+    #[arg(long)]
+    raw_spikes: bool,
 }
 
 impl Cli {
@@ -141,10 +145,11 @@ struct App {
     api_key: Option<String>,
     is_remote: bool,
     plots: PlotFlags,
+    raw_spikes: bool,
 }
 
 impl App {
-    fn new(skip_access: bool, plots: PlotFlags) -> Self {
+    fn new(skip_access: bool, plots: PlotFlags, raw_spikes: bool) -> Self {
         let (url, api_key, is_remote) = if skip_access {
             (DEFAULT_URL.to_string(), None, false)
         } else {
@@ -185,6 +190,7 @@ impl App {
             api_key,
             is_remote,
             plots,
+            raw_spikes,
         }
     }
 
@@ -239,7 +245,7 @@ impl App {
                     Ok(_) => {
                         let mut msg = format!("Saved: {filename}");
                         // Also export search spikes as Chrome trace
-                        if let Some(trace) = convert_spikes_to_chrome_trace(json) {
+                        if let Some(trace) = convert_spikes_to_chrome_trace(json, self.raw_spikes) {
                             let trace_file = format!("telemetry_{stamp}_spikes_trace.json");
                             match serde_json::to_string_pretty(&trace) {
                                 Ok(tc) => match fs::write(&trace_file, tc) {
@@ -524,7 +530,7 @@ fn for_each_segment(value: &Value, mut f: impl FnMut(&Value)) {
 
 /// Convert `result.search_spikes` from Qdrant telemetry into Chrome Trace Event format.
 /// The output can be opened in `chrome://tracing` or Perfetto for a flame-chart view.
-fn convert_spikes_to_chrome_trace(json: &Value) -> Option<Value> {
+fn convert_spikes_to_chrome_trace(json: &Value, raw: bool) -> Option<Value> {
     let spikes = json
         .pointer("/result/search_spikes")
         .and_then(|v| v.as_array())?;
@@ -534,24 +540,42 @@ fn convert_spikes_to_chrome_trace(json: &Value) -> Option<Value> {
 
     let mut events = Vec::new();
 
-    for spike in spikes {
-        let ts_str = spike.get("timestamp").and_then(|v| v.as_str())?;
-        let ts_us = parse_iso_to_micros(ts_str)?;
-        // Format time portion for top-level label
-        let time_label = chrono::DateTime::parse_from_rfc3339(ts_str)
-            .ok()
-            .map(|dt| dt.format("%H:%M:%S%.3f").to_string())
-            .unwrap_or_default();
-        emit_trace_events(&mut events, spike, ts_us, Some(&time_label), 0);
+    if raw {
+        // Use real timestamps — spikes appear at their actual positions on the timeline.
+        for spike in spikes {
+            let ts_str = spike.get("timestamp").and_then(|v| v.as_str())?;
+            let dt = chrono::DateTime::parse_from_rfc3339(ts_str).ok()?;
+            let ts_us = dt.timestamp_micros() as u64;
+            let time_label = dt.format("%H:%M:%S%.3f").to_string();
+            emit_trace_events(&mut events, spike, ts_us, Some(&time_label), 0);
+        }
+    } else {
+        // Sort by duration descending, place one-by-one starting at t=0.
+        let mut sorted: Vec<&Value> = spikes.iter().collect();
+        sorted.sort_by(|a, b| {
+            let da = a.get("duration_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let db = b.get("duration_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut cursor_us: u64 = 0;
+        for spike in &sorted {
+            let time_label = spike
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .map(|dt| dt.format("%H:%M:%S%.3f").to_string())
+                .unwrap_or_default();
+            emit_trace_events(&mut events, spike, cursor_us, Some(&time_label), 0);
+            let dur_ms = spike
+                .get("duration_ms")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            cursor_us += (dur_ms * 1000.0) as u64;
+        }
     }
 
     Some(serde_json::json!({ "traceEvents": events }))
-}
-
-/// Parse an ISO-8601 timestamp string into microseconds since Unix epoch.
-fn parse_iso_to_micros(ts: &str) -> Option<u64> {
-    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
-    Some(dt.timestamp_micros() as u64)
 }
 
 /// Recursively emit Chrome trace "X" (complete duration) events for a spike node and its children.
@@ -643,7 +667,7 @@ fn main() -> io::Result<()> {
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let mut app = App::new(cli.skip_access, plots);
+    let mut app = App::new(cli.skip_access, plots, cli.raw_spikes);
 
     // Run HTTP polling in a background thread so the UI stays responsive.
     let poll_url = app.url.clone();
