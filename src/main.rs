@@ -232,11 +232,30 @@ impl App {
 
     fn save_json(&mut self) {
         if let Some(json) = &self.last_json {
-            let filename = format!("telemetry_{}.json", Local::now().format("%Y%m%d_%H%M%S"));
+            let stamp = Local::now().format("%Y%m%d_%H%M%S");
+            let filename = format!("telemetry_{stamp}.json");
             match serde_json::to_string_pretty(json) {
                 Ok(content) => match fs::write(&filename, content) {
                     Ok(_) => {
-                        self.save_msg = Some((format!("Saved: {filename}"), Instant::now()));
+                        let mut msg = format!("Saved: {filename}");
+                        // Also export search spikes as Chrome trace
+                        if let Some(trace) = convert_spikes_to_chrome_trace(json) {
+                            let trace_file = format!("telemetry_{stamp}_spikes_trace.json");
+                            match serde_json::to_string_pretty(&trace) {
+                                Ok(tc) => match fs::write(&trace_file, tc) {
+                                    Ok(_) => {
+                                        msg.push_str(&format!(" + {trace_file}"));
+                                    }
+                                    Err(e) => {
+                                        msg.push_str(&format!(" (trace write err: {e})"));
+                                    }
+                                },
+                                Err(e) => {
+                                    msg.push_str(&format!(" (trace json err: {e})"));
+                                }
+                            }
+                        }
+                        self.save_msg = Some((msg, Instant::now()));
                     }
                     Err(e) => {
                         self.save_msg = Some((format!("Save error: {e}"), Instant::now()));
@@ -499,6 +518,91 @@ fn for_each_segment(value: &Value, mut f: impl FnMut(&Value)) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Convert `result.search_spikes` from Qdrant telemetry into Chrome Trace Event format.
+/// The output can be opened in `chrome://tracing` or Perfetto for a flame-chart view.
+fn convert_spikes_to_chrome_trace(json: &Value) -> Option<Value> {
+    let spikes = json
+        .pointer("/result/search_spikes")
+        .and_then(|v| v.as_array())?;
+    if spikes.is_empty() {
+        return None;
+    }
+
+    let mut events = Vec::new();
+
+    for spike in spikes {
+        let ts_str = spike.get("timestamp").and_then(|v| v.as_str())?;
+        let ts_us = parse_iso_to_micros(ts_str)?;
+        // Format time portion for top-level label
+        let time_label = chrono::DateTime::parse_from_rfc3339(ts_str)
+            .ok()
+            .map(|dt| dt.format("%H:%M:%S%.3f").to_string())
+            .unwrap_or_default();
+        emit_trace_events(&mut events, spike, ts_us, Some(&time_label), 0);
+    }
+
+    Some(serde_json::json!({ "traceEvents": events }))
+}
+
+/// Parse an ISO-8601 timestamp string into microseconds since Unix epoch.
+fn parse_iso_to_micros(ts: &str) -> Option<u64> {
+    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    Some(dt.timestamp_micros() as u64)
+}
+
+/// Recursively emit Chrome trace "X" (complete duration) events for a spike node and its children.
+/// When `time_label` is Some, it is appended to the top-level event name.
+fn emit_trace_events(
+    events: &mut Vec<Value>,
+    node: &Value,
+    start_us: u64,
+    time_label: Option<&str>,
+    tid: u64,
+) {
+    let raw_name = node
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let name = match time_label {
+        Some(t) => format!("{raw_name} @ {t}"),
+        None => raw_name.to_string(),
+    };
+    let dur_ms = node
+        .get("duration_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let dur_us = (dur_ms * 1000.0) as u64;
+
+    let mut args = serde_json::Map::new();
+    args.insert("duration_ms".into(), serde_json::json!(dur_ms));
+    if let Some(state) = node.get("state").and_then(|v| v.as_str()) {
+        args.insert("state".into(), serde_json::json!(state));
+    }
+
+    events.push(serde_json::json!({
+        "name": name,
+        "cat": "search",
+        "ph": "X",
+        "ts": start_us,
+        "dur": dur_us,
+        "pid": 0,
+        "tid": tid,
+        "args": args
+    }));
+
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        let mut child_start = start_us;
+        for child in children {
+            emit_trace_events(events, child, child_start, None, tid);
+            let child_dur_ms = child
+                .get("duration_ms")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            child_start += (child_dur_ms * 1000.0) as u64;
         }
     }
 }
