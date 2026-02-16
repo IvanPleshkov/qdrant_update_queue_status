@@ -362,7 +362,8 @@ impl App {
 /// Extract avg_duration_micros from /qdrant.Points/QueryBatch in grpc responses.
 fn find_query_batch_avg(value: &Value) -> Option<f64> {
     value
-        .pointer("/result/requests/grpc/responses/~1qdrant.Points~1QueryBatch/avg_duration_micros")
+        .pointer("/result/requests/grpc/responses/~1qdrant.Points~1QueryBatch/0/avg_duration_micros")
+        .or_else(|| value.pointer("/result/requests/grpc/responses/~1qdrant.Points~1QueryBatch/avg_duration_micros"))
         .and_then(|v| v.as_f64())
 }
 
@@ -862,10 +863,11 @@ fn draw_chart(
     let actual_max = data.iter().map(|(_, y)| *y).fold(0.0f64, f64::max);
     let y_max = actual_max.max(1.0);
 
+    let secs_per_tick = POLL_INTERVAL.as_secs_f64();
     let x_labels = vec![
-        Span::raw(format!("{:.1}s", x_min * 0.1)),
-        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * 0.1)),
-        Span::raw(format!("{:.1}s", x_max * 0.1)),
+        Span::raw(format!("{:.1}s", x_min * secs_per_tick)),
+        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * secs_per_tick)),
+        Span::raw(format!("{:.1}s", x_max * secs_per_tick)),
     ];
     let y_labels = vec![
         Span::raw("0"),
@@ -925,10 +927,11 @@ fn draw_search_chart(f: &mut Frame, app: &App, area: Rect) {
     let x_max = all_data.map(|(x, _)| *x).fold(0.0f64, f64::max);
     let y_max = app.max_y_search.max(app.max_y_filtered_search).max(1.0);
 
+    let secs_per_tick = POLL_INTERVAL.as_secs_f64();
     let x_labels = vec![
-        Span::raw(format!("{:.1}s", x_min * 0.1)),
-        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * 0.1)),
-        Span::raw(format!("{:.1}s", x_max * 0.1)),
+        Span::raw(format!("{:.1}s", x_min * secs_per_tick)),
+        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * secs_per_tick)),
+        Span::raw(format!("{:.1}s", x_max * secs_per_tick)),
     ];
     let y_labels = vec![
         Span::raw("0"),
@@ -984,10 +987,11 @@ fn draw_points_chart(f: &mut Frame, app: &App, area: Rect) {
     let x_max = all_data.map(|(x, _)| *x).fold(0.0f64, f64::max);
     let y_max = app.max_y_points.max(1.0);
 
+    let secs_per_tick = POLL_INTERVAL.as_secs_f64();
     let x_labels = vec![
-        Span::raw(format!("{:.1}s", x_min * 0.1)),
-        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * 0.1)),
-        Span::raw(format!("{:.1}s", x_max * 0.1)),
+        Span::raw(format!("{:.1}s", x_min * secs_per_tick)),
+        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * secs_per_tick)),
+        Span::raw(format!("{:.1}s", x_max * secs_per_tick)),
     ];
     let y_labels = vec![
         Span::raw("0"),
@@ -1050,10 +1054,11 @@ fn draw_segments_chart(f: &mut Frame, app: &App, area: Rect) {
     let x_max = app.total_segments.last().map(|(x, _)| *x).unwrap_or(1.0);
     let y_max = app.max_y_segments.max(1.0);
 
+    let secs_per_tick = POLL_INTERVAL.as_secs_f64();
     let x_labels = vec![
-        Span::raw(format!("{:.1}s", x_min * 0.1)),
-        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * 0.1)),
-        Span::raw(format!("{:.1}s", x_max * 0.1)),
+        Span::raw(format!("{:.1}s", x_min * secs_per_tick)),
+        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * secs_per_tick)),
+        Span::raw(format!("{:.1}s", x_max * secs_per_tick)),
     ];
     let y_labels = vec![
         Span::raw("0"),
