@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long)]
     points: bool,
 
+    /// Show upsert latency plot
+    #[arg(long)]
+    upsert: bool,
+
     /// Show segments count plot
     #[arg(long)]
     segments: bool,
@@ -50,21 +54,23 @@ struct Cli {
 
 impl Cli {
     fn plot_flags(&self) -> PlotFlags {
-        let any_set = self.queue || self.search || self.points || self.segments;
+        let any_set = self.queue || self.search || self.upsert || self.points || self.segments;
         if any_set {
             PlotFlags {
                 queue: self.queue,
                 search: self.search,
+                upsert: self.upsert,
                 points: self.points,
                 segments: self.segments,
             }
         } else {
-            // defaults: all except points
+            // defaults: queue, search, upsert
             PlotFlags {
                 queue: true,
                 search: true,
+                upsert: true,
                 points: false,
-                segments: true,
+                segments: false,
             }
         }
     }
@@ -74,13 +80,18 @@ impl Cli {
 struct PlotFlags {
     queue: bool,
     search: bool,
+    upsert: bool,
     points: bool,
     segments: bool,
 }
 
 impl PlotFlags {
     fn count(&self) -> u32 {
-        self.queue as u32 + self.search as u32 + self.points as u32 + self.segments as u32
+        self.queue as u32
+            + self.search as u32
+            + self.upsert as u32
+            + self.points as u32
+            + self.segments as u32
     }
 }
 
@@ -124,6 +135,9 @@ struct App {
     filtered_search_latencies: Vec<(f64, f64)>,
     max_y_search: f64,
     max_y_filtered_search: f64,
+    // upsert plot
+    upsert_latencies: Vec<(f64, f64)>,
+    max_y_upsert: f64,
     // points plot
     plain_points: Vec<(f64, f64)>,
     indexed_points: Vec<(f64, f64)>,
@@ -172,6 +186,8 @@ impl App {
             filtered_search_latencies: Vec::new(),
             max_y_search: 100.0,
             max_y_filtered_search: 100.0,
+            upsert_latencies: Vec::new(),
+            max_y_upsert: 100.0,
             plain_points: Vec::new(),
             indexed_points: Vec::new(),
             max_y_points: 100.0,
@@ -198,6 +214,7 @@ impl App {
         self.queue_lengths.clear();
         self.search_latencies.clear();
         self.filtered_search_latencies.clear();
+        self.upsert_latencies.clear();
         self.plain_points.clear();
         self.indexed_points.clear();
         self.total_segments.clear();
@@ -210,6 +227,7 @@ impl App {
         self.max_y_queue = 10.0;
         self.max_y_search = 100.0;
         self.max_y_filtered_search = 100.0;
+        self.max_y_upsert = 100.0;
         self.max_y_points = 100.0;
         self.max_y_segments = 10.0;
         self.recording = false;
@@ -227,6 +245,7 @@ impl App {
         drain_half(&mut self.queue_lengths);
         drain_half(&mut self.search_latencies);
         drain_half(&mut self.filtered_search_latencies);
+        drain_half(&mut self.upsert_latencies);
         drain_half(&mut self.plain_points);
         drain_half(&mut self.indexed_points);
         drain_half(&mut self.total_segments);
@@ -317,6 +336,17 @@ impl App {
                         }
                     }
 
+                    // upsert
+                    if let Some(upsert_lat) = find_upsert_avg(json_ref) {
+                        Self::push_bounded(
+                            &mut self.upsert_latencies,
+                            (self.tick, upsert_lat),
+                        );
+                        if upsert_lat > self.max_y_upsert {
+                            self.max_y_upsert = upsert_lat;
+                        }
+                    }
+
                     // points
                     let (plain, indexed) = find_segment_points(json_ref);
                     Self::push_bounded(&mut self.plain_points, (self.tick, plain));
@@ -357,6 +387,14 @@ impl App {
         }
         self.tick += 1.0;
     }
+}
+
+/// Extract avg_duration_micros from /qdrant.Points/Upsert in grpc responses.
+fn find_upsert_avg(value: &Value) -> Option<f64> {
+    value
+        .pointer("/result/requests/grpc/responses/~1qdrant.Points~1Upsert/0/avg_duration_micros")
+        .or_else(|| value.pointer("/result/requests/grpc/responses/~1qdrant.Points~1Upsert/avg_duration_micros"))
+        .and_then(|v| v.as_f64())
 }
 
 /// Extract avg_duration_micros from /qdrant.Points/QueryBatch in grpc responses.
@@ -782,6 +820,11 @@ fn draw(f: &mut Frame, app: &App) {
                 .last()
                 .map(|(_, v)| format!("{:.0}us", v))
                 .unwrap_or_else(|| "n/a".to_string());
+            let last_upsert = app
+                .upsert_latencies
+                .last()
+                .map(|(_, v)| format!("{:.0}us", v))
+                .unwrap_or_else(|| "n/a".to_string());
             let recording = if app.recording {
                 format!(" | samples: {}", app.queue_lengths.len())
             } else {
@@ -789,7 +832,7 @@ fn draw(f: &mut Frame, app: &App) {
             };
             (
                 format!(
-                    "[{mode}] Qdrant ONLINE | queue: {last_queue} | search: {last_search}{recording}{}",
+                    "[{mode}] Qdrant ONLINE | queue: {last_queue} | search: {last_search} | upsert: {last_upsert}{recording}{}",
                     save_info.unwrap_or_default()
                 ),
                 Style::default()
@@ -829,6 +872,10 @@ fn draw(f: &mut Frame, app: &App) {
     }
     if plots.search {
         draw_search_chart(f, app, chunks[idx]);
+        idx += 1;
+    }
+    if plots.upsert {
+        draw_upsert_chart(f, app, chunks[idx]);
         idx += 1;
     }
     if plots.points {
@@ -954,6 +1001,62 @@ fn draw_search_chart(f: &mut Frame, app: &App, area: Rect) {
         .data(&app.filtered_search_latencies);
 
     let chart = Chart::new(vec![ds_query, ds_filtered])
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .x_axis(
+            Axis::default()
+                .title("Time")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([x_min, x_max])
+                .labels(x_labels),
+        )
+        .y_axis(
+            Axis::default()
+                .title("us")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([0.0, y_max])
+                .labels(y_labels),
+        );
+    f.render_widget(chart, area);
+}
+
+fn draw_upsert_chart(f: &mut Frame, app: &App, area: Rect) {
+    let title = "Upsert Avg Latency (us)";
+    if app.upsert_latencies.is_empty() {
+        let msg = Paragraph::new("No data yet.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title),
+            );
+        f.render_widget(msg, area);
+        return;
+    }
+
+    let x_min = app.upsert_latencies.first().map(|(x, _)| *x).unwrap_or(0.0);
+    let x_max = app.upsert_latencies.last().map(|(x, _)| *x).unwrap_or(1.0);
+    let y_max = app.max_y_upsert.max(1.0);
+
+    let secs_per_tick = POLL_INTERVAL.as_secs_f64();
+    let x_labels = vec![
+        Span::raw(format!("{:.1}s", x_min * secs_per_tick)),
+        Span::raw(format!("{:.1}s", ((x_min + x_max) / 2.0) * secs_per_tick)),
+        Span::raw(format!("{:.1}s", x_max * secs_per_tick)),
+    ];
+    let y_labels = vec![
+        Span::raw("0"),
+        Span::raw(format!("{:.0}", y_max / 2.0)),
+        Span::raw(format!("{:.0}", y_max)),
+    ];
+
+    let ds_upsert = Dataset::default()
+        .name("Upsert")
+        .marker(ratatui::symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Yellow))
+        .data(&app.upsert_latencies);
+
+    let chart = Chart::new(vec![ds_upsert])
         .block(Block::default().borders(Borders::ALL).title(title))
         .x_axis(
             Axis::default()
